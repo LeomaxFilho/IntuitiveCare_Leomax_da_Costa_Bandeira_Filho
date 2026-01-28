@@ -1,0 +1,12 @@
+[project]
+name = "teste-leomax-da-costa-bandeira-filho"
+version = "0.1.0"
+description = "Teste para o desafio tecnico da Intuitive Care, desenvolvido por Leomax da Costa Bandeira Filho"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "basedpyright>=1.37.2",
+    "bs4>=0.0.2",
+    "pandas>=3.0.0",
+    "requests>=2.32.5",
+]
