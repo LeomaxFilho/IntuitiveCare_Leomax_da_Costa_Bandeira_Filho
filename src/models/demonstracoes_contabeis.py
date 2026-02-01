@@ -1,12 +1,11 @@
 import logging
 import zipfile
-import os
 from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
 import requests
-from bs4 import BeautifulSoup
+from src.models.funcs import (validar_cnpjs_flag, validar_valores_despesas_flag, validar_razao_social_flag, HtmlParser)
 
 logger = logging.getLogger(__name__)
 
@@ -35,15 +34,14 @@ class DemonstracoesContabeis:
 
         df_cadop_cancelados = pd.read_csv(BASE_URL_CADOP,sep=";",encoding="latin-1",decimal=",")
         df_cadop_cancelados.to_csv(f"{path_raw}/relatorio_cadop_canceladas.csv")
-        
+        df_cadop_cancelados["RegASNAtivo"] = False
         df_cadop = pd.read_csv(BASE_URL_CADOP_CANCELADAS,sep=";",encoding="latin-1",decimal=",")
         df_cadop.to_csv(f"{path_raw}/relatorio_cadop.csv")
+        df_cadop["RegASNAtivo"] = True
 
         df_cadop_concat = pd.concat([df_cadop, df_cadop_cancelados], ignore_index=True)
-        cols = ["REGISTRO_OPERADORA", "CNPJ", "Razao_Social"]
-        df_reg_ans = df_cadop_concat[cols]
-
-        df_reg_ans = df_reg_ans.rename(columns={'REGISTRO_OPERADORA': 'REG_ANS'}) # type: ignore[reportCallIssue]
+        
+        df_reg_ans = df_cadop_concat.rename(columns={"REGISTRO_OPERADORA": "REG_ANS"}) # type: ignore[reportCallIssue]
         df_reg_ans.to_csv(f"{path_interim}/reg_ans_cnpj.csv")
 
         return df_reg_ans
@@ -124,69 +122,89 @@ class DemonstracoesContabeis:
 
         return
 
-    def consolidar_analise(self) -> pd.DataFrame:
+    def consolidar_analise(self) -> tuple[pd.DataFrame, pd.DataFrame]:
         df_reg_ans = self.get_relatorios_cadop()
 
         dfs = []
         for ano, trimestres in self.trimestres.items():
             for trimestre in trimestres:
                 df = pd.read_csv(f"{DATA_RAW_DIR}/demonstracoes_contabeis/{trimestre}.csv", sep=";",encoding="latin-1",decimal=",")
-                
+
                 df["Ano"] = ano
                 df["Trimestre"] = trimestre
                 dfs.append(df)
 
         df_concat = pd.concat(dfs, ignore_index=True)
-        df_filtrado = df_concat[df_concat.DESCRICAO.str.contains(r'(?=.*eventos)(?=.*sinistros)', case=False, na=False, regex=True)]
-        df_filrado_com_cnpj = df_filtrado.merge(df_reg_ans, how="inner", on="REG_ANS")
+        df_filtrado = df_concat[df_concat.DESCRICAO.str.contains(r"(?=.*eventos)(?=.*sinistros)", case=False, na=False, regex=True)]
+        df_filrado_com_cnpj = df_filtrado.merge(df_reg_ans, how="left", on="REG_ANS")
         df_filrado_com_cnpj["ValorDespesas"] = df_filrado_com_cnpj.VL_SALDO_FINAL - df_filrado_com_cnpj.VL_SALDO_INICIAL
-        cols = ['CNPJ', 'Razao_Social', 'ValorDespesas']
+        cols = ["CNPJ", "Razao_Social", "Trimestre", "Ano", "ValorDespesas"]
         df_fim = df_filrado_com_cnpj[cols]
         df_fim = df_fim.dropna() # qualquer linha que tiver a ausencia de um desses valores é uma linha inválida
 
         df_fim = df_fim.rename(columns={
-            'Razao_Social' : 'RazaoSocial'
+            "Razao_Social" : "RazaoSocial"
         } )# type: ignore[reportCallIssue]
 
-        return df_fim
+        return df_fim, df_filrado_com_cnpj
 
-    def salvar_dataframe_zip(self, df):
-        nome_arquivo_csv='consolidado_despesas.csv'
-        path = f"{DATA_PROCESSADO_DIR}/consolidado_despesas.zip"
+    def salvar_dataframe_csv(self, df):
+        path = DATA_PROCESSADO_DIR / "consolidado_despesas.csv"
+        zip_path = DATA_PROCESSADO_DIR / "consolidado_despesas.zip"
 
-        diretorio = os.path.dirname(path)
-        if diretorio and not os.path.exists(diretorio):
-            os.makedirs(diretorio)
+        DATA_PROCESSADO_DIR.mkdir(parents=True, exist_ok=True)
 
-        with zipfile.ZipFile(path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            csv_data = df.to_csv(index=False)
-            zipf.writestr(nome_arquivo_csv, csv_data)
+        df.to_csv(path, index=False)
+        
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zip_ref:
+                zip_ref.write(path, arcname=path.name)
 
-class HtmlParser:
-    @staticmethod
-    def parse_html_anos(html_content: str) -> list[str]:
-        soup = BeautifulSoup(html_content, "html.parser")
-        links = soup.find_all("a", href=True)
 
-        anos = [
-            link.text.strip().rstrip("/")
-            for link in links
-            if link.text.strip().rstrip("/").isdigit()
-        ]
-        return anos
+    def validar_dados(self, df):
+        df = (df
+            .pipe(validar_cnpjs_flag)
+            .pipe(validar_valores_despesas_flag)
+            .pipe(validar_razao_social_flag)
+        )
 
-    @staticmethod
-    def parse_html_demonstracoes(
-        html_content: str, trimestres_faltando: int
-    ) -> list[str]:
-        soup = BeautifulSoup(html_content, "html.parser")
-        links = soup.find_all("a", href=True)
-        demonstracoes = [
-            link.text.strip().removesuffix(".zip")
-            for link in links
-            if link.text.strip().endswith(".zip")
-        ]
-        if len(demonstracoes) > trimestres_faltando:
-            demonstracoes = demonstracoes[-trimestres_faltando:]
+        return df
 
-        return demonstracoes
+    def enriquecimento_dataframe(self, df): #os dados das operadoras ativas e canceladas ja estao incluidos, nesse caso eu vou apenas adicionar  RegistroANS , Modalidade e UF
+        cols = ["REG_ANS", "CNPJ", "Razao_Social", "Trimestre", "Ano", "ValorDespesas", "Modalidade", "UF", "CnpjValido", "ValorValido", "RazaoSocialValida", "RegASNAtivo"]
+        df = df[cols]
+        df = df.rename(columns = {
+            "Razao_Social" : "RazaoSocial"
+        })
+        # veja que eu fiz essa analise dos valores que estavam ausentes, mas percebi que haviam tambem os registros da ANS que estavam cancelados,
+        # entao eu inclui esses valores e deixei eles como uma flag se estavam cancelados ou nao, tornando os dados mais completos, veja o notebook 1.0
+        # tem uma analise que mostra que nao existe CNPJ sem correspondente
+        return df
+
+    def agregacao_multiplas_estrategias(self, df):
+        df_uf_razao_social = df.groupby(["UF", "CNPJ"]).agg(
+            RazaoSocial = ("RazaoSocial", "first"),
+            MediaDespesas = ("ValorDespesas", "mean"),
+            TotalDespesas = ("ValorDespesas", "sum")
+        ).reset_index()
+        df_uf_razao_social = df_uf_razao_social[["UF", "RazaoSocial", "MediaDespesas", "TotalDespesas"]].sort_values(by="TotalDespesas", ascending=False)
+
+        df_total_despesas_operadora = df.groupby("CNPJ").agg(
+            RazaoSocial = ("RazaoSocial", "first"),
+            TotalDespesas = ("ValorDespesas", "sum")
+        ).reset_index()
+        df_total_despesas_operadora = df_uf_razao_social[["RazaoSocial", "TotalDespesas"]].sort_values(by="TotalDespesas", ascending=False)
+
+        df_medias_despezas_operadora = df.groupby(["CNPJ", "Trimestre"]).agg(
+            RazaoSocial = ("RazaoSocial", "first"),
+            MediaDespesaTrimestre = ("ValorDespesas", "mean"),
+            DesvioPadraoDespesaTrimestre = ("ValorDespesas", "std")
+        ).reset_index()
+        df_medias_despezas_operadora = df_medias_despezas_operadora.sort_values(by="MediaDespesaTrimestre", ascending=False)
+
+        df_medias_despezas_uf = df.groupby(["UF", "Trimestre"]).agg(
+            MediaDespesaTrimestre = ("ValorDespesas", "mean"),
+            DesvioPadraoDespesaTrimestre = ("ValorDespesas", "std")
+        ).reset_index()
+        df_medias_despezas_uf = df_medias_despezas_uf.sort_values(by="MediaDespesaTrimestre", ascending=False)
+
+        return df_uf_razao_social, df_total_despesas_operadora, df_medias_despezas_operadora, df_medias_despezas_uf
